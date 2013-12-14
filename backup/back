@@ -1,0 +1,211 @@
+#!/usr/bin/ruby
+
+require 'pp'
+require 'fileutils'
+require 'open3.rb'
+require 'rye'
+
+
+
+# Simple backup routine written in Ruby.
+#
+# @author Thomas Eichberger, thomas.eichberger@gmail.com, 2013 Vienna, Austria, Europe, Milky Way.
+# git@github.com:xtraclass/azizi.git
+class Backup
+
+    def initialize( &block )
+        run &block
+    end
+
+    def run( &block )
+        instance_eval &block # so that the code inside the block has access to the methods of this class
+
+        log "1 Backup #{@name}" # 1 means start, 0 end --> helps with grep of the logging files
+        puts '--------------------------------------'
+        puts @name
+        puts '--------------------------------------'
+        begin
+            perform
+        rescue RuntimeError => x
+            log "0 Backup with ERROR #{x}"
+        ensure
+            log "0 Backup #{@name}"
+        end
+    end
+
+    # username@hostname
+    # TODO split this to username and host
+    def host( value )
+        @host = value
+    end
+
+    # just a unique name for the current backup definition, not really used yet
+    # TODO What is this needed for?
+    def name( value )
+        @name = value
+    end
+
+    # The directory to which the files should be backuped to. (Is this english???)
+    def target_directory( value )
+        @target_directory = value
+    end
+
+    # The directory from which the files are copied. If nil, the home directory is used (for ssh actions).
+    def source_directory( value )
+        @source_directory = value
+    end
+
+    # TODO Rename this property.
+    # The command to be executed on the remote host (by ssh).
+    def ssh( value )
+        @ssh = value
+    end
+
+    # Logs the message to the syslog facility and to the console.
+    def log( message )
+        %x[ /usr/bin/logger -t BACKUP -- "#{message}" ]
+        puts message
+    end
+
+    # Add the given directory names, so that those directories are backuped later.
+    def copy( *dirs )
+        if @dirs
+            dirs.each { |dir| @dirs << dirs } # TODO There is a better way, but I don't remember now.
+        else
+            @dirs = dirs
+        end
+    end
+
+    # Add the given file names, so that those files are backuped later.
+    # TODO copyfiles or copyfile?
+    # TODO Find a way to merge copy and copyfile, i.e. copying of directories and files.
+    def copyfile( *files )
+        if @files
+            files.each { |file| @files << file }
+        else
+            @files = files
+        end
+    end
+
+    protected
+
+    # Performs a system command.
+    def exec(command, &block_for_line_handling)
+        code = lambda do |i, o, e, t|
+            pid = t.pid if t
+            if block_for_line_handling
+                o.each_line { |line| block_for_line_handling.call line }
+            end
+            if t
+                return exit_status = t.value
+            else
+                return nil
+            end
+        end
+        Open3.popen3(command, &code)
+    end
+
+    # Returns the from path for rsync.
+    def from( file, dir )
+        f = ''
+        f << @host << ':' if @host
+        f << @source_directory << '/' if @source_directory
+        f << file
+
+        local_file = ''
+        local_file << @source_directory << '/' if @source_directory
+        local_file << file
+
+        f << '/' if ( dir and ( @host or File.directory? local_file ) )
+        f
+    end
+
+    # Returns the to path for rsync.
+    def to( file )
+        todir = "#{@target_directory}/#{file}"
+        FileUtils.mkpath @target_directory unless File.exists?( @target_directory )
+        todir
+    end
+
+    # Does the copying, aka backup stuff.
+    def perform()
+        # If a command for ssh is given, this is performed before the actual backup.
+        if @ssh
+            cmd = "ssh -q -t #{@host} '#{@ssh}'"
+            log "ssh #{@host}"
+            exec cmd do |line|
+                puts line
+            end
+        end
+
+        return unless @files or @dirs
+
+        if @host # remote
+            h = "#{@host}:"
+            if @source_directory
+                h = "#{h}/#{@source_directory}"
+            end
+        else # local
+            if @source_directory
+                h = "#{@source_directory}/"
+            else
+                fail 'Either host or source_directory must be given.'
+            end
+        end
+        # It's good for rsync if the source directory has a trailing /, but the target directory not.
+
+        # Low priority rsync command
+        rsync = "nice --adjustment=15 ionice -c 2 -n 7 /usr/bin/rsync"
+        # TODO excludes should be changeable, probably fields like @ssh and so on.
+        excludes = "--exclude 'Extensions' --exclude 'jbdevstudio*jar' --exclude '.git' --exclude '/.ccache' --exclude '/.thumbnails' --exclude 'nohup.out' --exclude '.config/google-chrome/Default' --exclude '/.cache' --exclude=logs --exclude=log --exclude=.git --exclude=tmp --exclude=work"
+
+        # Copies files and directories
+        @files.each do |file|
+            log from( file, false ) + '  -->  ' + to( file )
+            exec "#{rsync} #{excludes} -a -q  #{from(file, false)} #{to(file)}" do |line|
+                puts line
+            end
+        end if @files
+
+        @dirs.each do |dir|
+            log from( dir, true ) + '  ==>  ' + to( dir )
+            exec "#{rsync} #{excludes} -a -q  #{from(dir, true)} #{to(dir)}" do |line|
+                puts line
+            end
+        end if @dirs
+    end
+
+end
+
+
+
+# Just a helper function to make things a little bit easier.
+def backup( &block )
+    Backup.new( &block )
+end
+
+
+
+# A backup definition.
+# Backups some directories and files of a remote host.
+backup do
+    name 'x'
+    host 'user1@www.x.com'
+    target_directory '/g/backup-x'
+    
+    ssh 'cd mysqlbin && ./mysqldump -f -l --add-drop-table -u xx -pxx xx > $HOME/xx.sql && cd && tar cfz xx.tz xx.sql && rm xx.sql'
+    copyfile 'xx.tz'
+    copy '.todo', 'bin', 'conf', 'xx1', 'xx2'
+end 
+
+
+
+# A backup definition.
+# Backups some directories of a local host.
+backup do
+    name 'mine'
+    source_directory '/mine'
+    target_directory '/g/backup-mine'
+    
+    copy 'Pictures', 'VMs', 'dev'
+end 
